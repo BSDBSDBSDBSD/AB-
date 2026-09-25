@@ -12,19 +12,25 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.Normalizer
 import kotlin.math.abs
 import kotlin.math.max
@@ -187,17 +193,75 @@ fun autoSelectDuplicates(groups: List<List<Song>>): Set<Long> {
 
 // ---------- Activity ----------
 
+// ---------- Crash log (shows the real error next launch instead of a silent close) ----------
+
+object CrashLog {
+    private const val FILE = "last_crash.txt"
+    fun install(ctx: android.content.Context) {
+        val app = ctx.applicationContext
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val text = "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · " +
+                    "${Build.MANUFACTURER} ${Build.MODEL}\nThread: ${t.name}\n\n" +
+                    android.util.Log.getStackTraceString(e)
+                File(app.filesDir, FILE).writeText(text)
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
+        }
+    }
+    fun read(ctx: android.content.Context): String? =
+        File(ctx.filesDir, FILE).takeIf { it.exists() }?.let { runCatching { it.readText() }.getOrNull() }
+    fun clear(ctx: android.content.Context) { runCatching { File(ctx.filesDir, FILE).delete() } }
+}
+
+/** Resource id of the developer photo (exists only in the credited flavor). */
+fun devPhotoResId(ctx: android.content.Context): Int =
+    ctx.resources.getIdentifier("dev_photo", "drawable", ctx.packageName)
+
+/** Posts a persistent "built by" notification with the photo (credited flavor only). */
+fun showCreditNotification(ctx: android.content.Context) {
+    try {
+        val nm = ctx.getSystemService(android.app.NotificationManager::class.java) ?: return
+        val channelId = "credit"
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(channelId, "קרדיט", android.app.NotificationManager.IMPORTANCE_DEFAULT)
+            )
+        }
+        val resId = devPhotoResId(ctx)
+        val photo = if (resId != 0) android.graphics.BitmapFactory.decodeResource(ctx.resources, resId) else null
+        val builder = androidx.core.app.NotificationCompat.Builder(ctx, channelId)
+            .setSmallIcon(android.R.drawable.star_big_on)
+            .setContentTitle("נבנה על ידי אורי שרגא יעקבסון האלוף")
+            .setContentText("שירים כפולים")
+            .setOngoing(true)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_DEFAULT)
+        if (photo != null) {
+            builder.setLargeIcon(photo)
+            builder.setStyle(
+                androidx.core.app.NotificationCompat.BigPictureStyle()
+                    .bigPicture(photo)
+                    .bigLargeIcon(null as android.graphics.Bitmap?)
+            )
+        }
+        nm.notify(1001, builder.build())
+    } catch (_: Exception) {}
+}
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        CrashLog.install(this)
         super.onCreate(savedInstanceState)
-        setContent { AppRoot() }
+        val crash = CrashLog.read(this)
+        setContent { AppRoot(lastCrash = crash) }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppRoot() {
+fun AppRoot(lastCrash: String? = null) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -211,6 +275,35 @@ fun AppRoot() {
     var groups by remember { mutableStateOf<List<List<Song>>>(emptyList()) }
     var selected by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var pendingDeleteIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+    var showCrash by remember { mutableStateOf(lastCrash != null) }
+
+    // Credited flavor: request notification permission (Android 13+) and post the credit notice.
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> if (granted) showCreditNotification(context) }
+    LaunchedEffect(Unit) {
+        if (BuildConfig.SHOW_CREDIT) {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                androidx.core.content.ContextCompat.checkSelfPermission(
+                    context, android.Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                showCreditNotification(context)
+            }
+        }
+    }
+
+    if (showCrash && lastCrash != null) {
+        AlertDialog(
+            onDismissRequest = { showCrash = false; CrashLog.clear(context) },
+            title = { Text("האפליקציה נסגרה בגלל שגיאה") },
+            text = { Text(lastCrash.take(2000)) },
+            confirmButton = { TextButton(onClick = { showCrash = false; CrashLog.clear(context) }) { Text("סגור") } }
+        )
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -240,15 +333,21 @@ fun AppRoot() {
 
     fun runScan() {
         scanning = true
+        errorMsg = null
         scope.launch {
-            val songs = withContext(Dispatchers.IO) { loadSongs(context) }
-            val result = withContext(Dispatchers.Default) {
-                findDuplicateGroups(songs, simThreshold.toDouble(), durTolerance.toLong())
+            try {
+                val songs = withContext(Dispatchers.IO) { loadSongs(context) }
+                val result = withContext(Dispatchers.Default) {
+                    findDuplicateGroups(songs, simThreshold.toDouble(), durTolerance.toLong())
+                }
+                allSongs = songs
+                groups = result
+                selected = emptySet()
+            } catch (e: Throwable) {
+                errorMsg = "שגיאה בסריקה: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                scanning = false
             }
-            allSongs = songs
-            groups = result
-            selected = emptySet()
-            scanning = false
         }
     }
 
@@ -299,12 +398,26 @@ fun AppRoot() {
                 .fillMaxSize()
         ) {
             if (BuildConfig.SHOW_CREDIT) {
-                Text(
-                    "נבנה על ידי אורי שרגא יעקבסון האלוף",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 20.sp,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)
-                )
+                val photoId = remember { devPhotoResId(context) }
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (photoId != 0) {
+                        Image(
+                            painter = painterResource(id = photoId),
+                            contentDescription = "אורי שרגא יעקבסון",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.size(96.dp).clip(CircleShape)
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    Text(
+                        "נבנה על ידי אורי שרגא יעקבסון האלוף",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    )
+                }
             }
 
             if (!hasPermission) {
@@ -351,7 +464,12 @@ fun AppRoot() {
 
             Spacer(Modifier.height(12.dp))
 
-            if (groups.isEmpty() && !scanning && allSongs.isNotEmpty()) {
+            errorMsg?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp,
+                    modifier = Modifier.padding(vertical = 6.dp))
+            }
+
+            if (groups.isEmpty() && !scanning && allSongs.isNotEmpty() && errorMsg == null) {
                 Text("לא נמצאו כפילויות בקריטריונים הנוכחיים 🎉")
             }
 
