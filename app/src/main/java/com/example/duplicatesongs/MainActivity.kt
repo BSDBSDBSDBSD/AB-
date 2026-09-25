@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -400,7 +401,7 @@ fun AppRoot(lastCrash: String? = null) {
             if (BuildConfig.SHOW_CREDIT) {
                 val photoId = remember { devPhotoResId(context) }
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     if (photoId != 0) {
@@ -408,14 +409,23 @@ fun AppRoot(lastCrash: String? = null) {
                             painter = painterResource(id = photoId),
                             contentDescription = "אורי שרגא יעקבסון",
                             contentScale = ContentScale.Crop,
-                            modifier = Modifier.size(96.dp).clip(CircleShape)
+                            modifier = Modifier
+                                .size(160.dp)
+                                .clip(CircleShape)
+                                .border(4.dp, MaterialTheme.colorScheme.primary, CircleShape)
                         )
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(12.dp))
                     }
                     Text(
-                        "נבנה על ידי אורי שרגא יעקבסון האלוף",
+                        "נבנה על ידי",
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "אורי שרגא יעקבסון האלוף",
                         fontWeight = FontWeight.Bold,
-                        fontSize = 20.sp
+                        fontSize = 24.sp,
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
             }
