@@ -22,8 +22,25 @@ android {
         }
     }
 
+    // Two versions: one with the big "built by" credit, one without.
+    flavorDimensions += "branding"
+    productFlavors {
+        create("credited") {
+            dimension = "branding"
+            applicationIdSuffix = ".credited"
+            buildConfigField("boolean", "SHOW_CREDIT", "true")
+            resValue("string", "app_name", "שירים כפולים — אורי")
+        }
+        create("plain") {
+            dimension = "branding"
+            buildConfigField("boolean", "SHOW_CREDIT", "false")
+            resValue("string", "app_name", "שירים כפולים")
+        }
+    }
+
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"

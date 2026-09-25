@@ -29,22 +29,23 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Build debug APKs (both flavors)
+        run: gradle assembleCreditedDebug assemblePlainDebug --no-daemon --stacktrace
 
-      - name: Upload APK artifact
+      - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: duplicate-song-finder-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/**/debug/*.apk
 
-      - name: Publish APK as GitHub release "latest"
+      - name: Publish APKs as GitHub release "latest"
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk DuplicateSongFinder.apk
+          cp app/build/outputs/apk/credited/debug/app-credited-debug.apk DuplicateSongFinder-Uri.apk
+          cp app/build/outputs/apk/plain/debug/app-plain-debug.apk DuplicateSongFinder.apk
           gh release delete latest -y --cleanup-tag || true
-          gh release create latest DuplicateSongFinder.apk \
+          gh release create latest DuplicateSongFinder-Uri.apk DuplicateSongFinder.apk \
             --title "Duplicate Song Finder – build ${{ github.run_number }}" \
-            --notes "APK לבדיקה (debug). commit ${{ github.sha }}" --target ${{ github.sha }}
+            --notes "שתי גרסאות: עם קרדיט (Uri) ובלי. APK debug. commit ${{ github.sha }}" --target ${{ github.sha }}

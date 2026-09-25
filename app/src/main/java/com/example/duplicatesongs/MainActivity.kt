@@ -37,6 +37,7 @@ data class Song(
     val title: String,
     val path: String,
     val durationSec: Long,
+    val sizeBytes: Long,
     val norm: String
 ) {
     val uri: Uri get() = ContentUris.withAppendedId(
@@ -113,7 +114,8 @@ fun loadSongs(context: android.content.Context): List<Song> {
         MediaStore.Audio.Media._ID,
         MediaStore.Audio.Media.DISPLAY_NAME,
         MediaStore.Audio.Media.DATA,
-        MediaStore.Audio.Media.DURATION
+        MediaStore.Audio.Media.DURATION,
+        MediaStore.Audio.Media.SIZE
     )
     val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
     context.contentResolver.query(collection, projection, selection, null, null)?.use { cursor ->
@@ -121,12 +123,14 @@ fun loadSongs(context: android.content.Context): List<Song> {
         val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
         val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
         val durCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+        val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
         while (cursor.moveToNext()) {
             val id = cursor.getLong(idCol)
             val name = cursor.getString(nameCol) ?: continue
             val path = cursor.getString(dataCol) ?: name
             val durMs = cursor.getLong(durCol)
-            songs.add(Song(id, name, path, durMs / 1000, normalizeTitle(name)))
+            val size = cursor.getLong(sizeCol)
+            songs.add(Song(id, name, path, durMs / 1000, size, normalizeTitle(name)))
         }
     }
     return songs
@@ -138,11 +142,15 @@ fun findDuplicateGroups(
     durationToleranceSec: Long
 ): List<List<Song>> {
     val uf = UnionFind(songs.size)
-    for (i in songs.indices) {
-        for (j in i + 1 until songs.size) {
-            val a = songs[i]; val b = songs[j]
-            if (abs(a.durationSec - b.durationSec) > durationToleranceSec) continue
-            if (similarity(a.norm, b.norm) >= simThreshold) uf.union(i, j)
+    // Compare only songs with near durations: sort by duration and slide a window,
+    // so we avoid the full O(n^2) comparison on large libraries.
+    val order = songs.indices.sortedBy { songs[it].durationSec }
+    for (p in order.indices) {
+        val i = order[p]
+        for (q in p + 1 until order.size) {
+            val j = order[q]
+            if (songs[j].durationSec - songs[i].durationSec > durationToleranceSec) break
+            if (similarity(songs[i].norm, songs[j].norm) >= simThreshold) uf.union(i, j)
         }
     }
     val groups = LinkedHashMap<Int, MutableList<Song>>()
@@ -155,6 +163,26 @@ fun findDuplicateGroups(
 fun formatDuration(sec: Long): String {
     val m = sec / 60; val s = sec % 60
     return "%d:%02d".format(m, s)
+}
+
+fun formatSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "%.0f KB".format(bytes / 1024.0)
+    bytes < 1024L * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
+    else -> "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
+}
+
+/**
+ * For each group, marks all songs EXCEPT the "best" one (largest file = usually best
+ * quality) for deletion. Returns the set of song ids to delete.
+ */
+fun autoSelectDuplicates(groups: List<List<Song>>): Set<Long> {
+    val toDelete = HashSet<Long>()
+    for (group in groups) {
+        val keep = group.maxByOrNull { it.sizeBytes } ?: continue
+        for (song in group) if (song.id != keep.id) toDelete.add(song.id)
+    }
+    return toDelete
 }
 
 // ---------- Activity ----------
@@ -182,23 +210,24 @@ fun AppRoot() {
     var allSongs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var groups by remember { mutableStateOf<List<List<Song>>>(emptyList()) }
     var selected by remember { mutableStateOf<Set<Long>>(emptySet()) }
-    var pendingDeleteUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingDeleteIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasPermission = granted }
 
-    // Handles the "confirm delete" system dialog required on Android 10+ (API 29+)
+    fun removeIds(ids: Set<Long>) {
+        allSongs = allSongs.filterNot { it.id in ids }
+        groups = groups.map { g -> g.filterNot { it.id in ids } }.filter { it.size > 1 }
+        selected = selected - ids
+    }
+
+    // Handles the "confirm delete" system dialog required on Android 10+ (API 29+).
     val deleteRequestLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            pendingDeleteUri?.let { uri ->
-                allSongs = allSongs.filterNot { it.uri == uri }
-                groups = groups.map { g -> g.filterNot { it.uri == uri } }.filter { it.size > 1 }
-            }
-        }
-        pendingDeleteUri = null
+        if (result.resultCode == android.app.Activity.RESULT_OK) removeIds(pendingDeleteIds)
+        pendingDeleteIds = emptySet()
     }
 
     fun requestPermission() {
@@ -223,31 +252,39 @@ fun AppRoot() {
         }
     }
 
-    fun deleteOne(song: Song) {
+    /** Deletes the given song ids. On Android 10+ this shows one system confirmation for all. */
+    fun deleteIds(ids: Set<Long>) {
+        if (ids.isEmpty()) return
+        val uris = ids.map { ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, it) }
         scope.launch {
             withContext(Dispatchers.IO) {
                 try {
-                    context.contentResolver.delete(song.uri, null, null)
-                    withContext(Dispatchers.Main) {
-                        allSongs = allSongs.filterNot { it.id == song.id }
-                        groups = groups.map { g -> g.filterNot { it.id == song.id } }.filter { it.size > 1 }
-                    }
-                } catch (e: SecurityException) {
-                    // Android 10+ requires user confirmation via a system dialog.
-                    val intentSender = when {
-                        Build.VERSION.SDK_INT >= 30 ->
-                            MediaStore.createDeleteRequest(context.contentResolver, listOf(song.uri)).intentSender
-                        Build.VERSION.SDK_INT >= 29 && e is RecoverableSecurityException ->
-                            e.userAction.actionIntent.intentSender
-                        else -> null
-                    }
-                    withContext(Dispatchers.Main) {
-                        pendingDeleteUri = song.uri
-                        if (intentSender != null) {
-                            deleteRequestLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val pi = MediaStore.createDeleteRequest(context.contentResolver, uris)
+                        withContext(Dispatchers.Main) {
+                            pendingDeleteIds = ids
+                            deleteRequestLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
                         }
+                    } else {
+                        // Older Android: try direct delete per file; may prompt on API 29.
+                        var deleted = false
+                        for (uri in uris) {
+                            try { context.contentResolver.delete(uri, null, null); deleted = true }
+                            catch (e: SecurityException) {
+                                if (Build.VERSION.SDK_INT >= 29 && e is RecoverableSecurityException) {
+                                    withContext(Dispatchers.Main) {
+                                        pendingDeleteIds = ids
+                                        deleteRequestLauncher.launch(
+                                            IntentSenderRequest.Builder(e.userAction.actionIntent.intentSender).build()
+                                        )
+                                    }
+                                    return@withContext
+                                }
+                            }
+                        }
+                        if (deleted) withContext(Dispatchers.Main) { removeIds(ids) }
                     }
-                }
+                } catch (e: Exception) { /* ignore */ }
             }
         }
     }
@@ -261,6 +298,15 @@ fun AppRoot() {
                 .padding(16.dp)
                 .fillMaxSize()
         ) {
+            if (BuildConfig.SHOW_CREDIT) {
+                Text(
+                    "נבנה על ידי אורי שרגא יעקבסון האלוף",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)
+                )
+            }
+
             if (!hasPermission) {
                 Text("כדי לסרוק את השירים במכשיר, צריך לאשר גישה לקבצי מדיה.")
                 Spacer(Modifier.height(12.dp))
@@ -281,8 +327,26 @@ fun AppRoot() {
                 }
                 Spacer(Modifier.width(12.dp))
                 if (allSongs.isNotEmpty()) {
-                    Text("${allSongs.size} שירים · ${groups.size} קבוצות כפולות", fontSize = 13.sp)
+                    Text("${allSongs.size} שירים · ${groups.size} קבוצות", fontSize = 13.sp)
                 }
+            }
+
+            if (groups.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = { selected = autoSelectDuplicates(groups) }) {
+                        Text("סמן כפולים אוטומטית")
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    if (selected.isNotEmpty()) {
+                        TextButton(onClick = { selected = emptySet() }) { Text("נקה") }
+                    }
+                }
+                Button(
+                    onClick = { deleteIds(selected) },
+                    enabled = selected.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) { Text("מחק מסומנים (${selected.size})") }
             }
 
             Spacer(Modifier.height(12.dp))
@@ -298,20 +362,30 @@ fun AppRoot() {
                         .padding(vertical = 6.dp)) {
                         Column(Modifier.padding(12.dp)) {
                             Text("קבוצה של ${group.size} שירים דומים", fontWeight = FontWeight.Bold)
+                            val best = group.maxByOrNull { it.sizeBytes }
                             group.forEach { song ->
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
+                                    Checkbox(
+                                        checked = song.id in selected,
+                                        onCheckedChange = { checked ->
+                                            selected = if (checked) selected + song.id else selected - song.id
+                                        }
+                                    )
                                     Column(Modifier.weight(1f)) {
-                                        Text(song.title, fontSize = 14.sp)
                                         Text(
-                                            "${formatDuration(song.durationSec)} · ${song.path}",
+                                            song.title + if (song.id == best?.id) "  ⭐" else "",
+                                            fontSize = 14.sp
+                                        )
+                                        Text(
+                                            "${formatDuration(song.durationSec)} · ${formatSize(song.sizeBytes)}",
                                             fontSize = 11.sp
                                         )
+                                        Text(song.path, fontSize = 10.sp, maxLines = 1)
                                     }
-                                    TextButton(onClick = { deleteOne(song) }) { Text("מחק") }
+                                    TextButton(onClick = { deleteIds(setOf(song.id)) }) { Text("מחק") }
                                 }
                             }
                         }
