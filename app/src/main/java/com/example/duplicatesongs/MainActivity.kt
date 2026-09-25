@@ -1,6 +1,6 @@
 package com.example.duplicatesongs
 
-import android.app.RecoverableActionException
+import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -233,12 +233,12 @@ fun AppRoot() {
                         groups = groups.map { g -> g.filterNot { it.id == song.id } }.filter { it.size > 1 }
                     }
                 } catch (e: SecurityException) {
-                    // Android 10+ requires user confirmation via system dialog
+                    // Android 10+ requires user confirmation via a system dialog.
                     val intentSender = when {
-                        Build.VERSION.SDK_INT >= 30 -> {
+                        Build.VERSION.SDK_INT >= 30 ->
                             MediaStore.createDeleteRequest(context.contentResolver, listOf(song.uri)).intentSender
-                        }
-                        e is RecoverableActionException -> null
+                        Build.VERSION.SDK_INT >= 29 && e is RecoverableSecurityException ->
+                            e.userAction.actionIntent.intentSender
                         else -> null
                     }
                     withContext(Dispatchers.Main) {
