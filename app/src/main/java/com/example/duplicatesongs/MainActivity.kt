@@ -64,9 +64,13 @@ fun normalizeTitle(raw: String): String {
     var s = raw.substringBeforeLast('.', raw) // drop extension if present
     s = Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
     s = s.lowercase()
-    s = s.replace(Regex("\\([^)]*\\)|\\[[^]]*]|\\{[^}]*}"), " ")
+    // Remove content in brackets. Braces are escaped because Android's regex engine
+    // treats an unescaped { or } as a quantifier and throws a syntax error.
+    s = s.replace(Regex("\\([^)]*\\)"), " ")   // ( ... )
+    s = s.replace(Regex("\\[[^\\]]*\\]"), " ")  // [ ... ]
+    s = s.replace(Regex("\\{[^}]*\\}"), " ")    // { ... }
     for (w in NOISE_WORDS) {
-        s = s.replace(Regex("\\b$w\\b"), " ")
+        s = s.replace(Regex("\\b" + Regex.escape(w) + "\\b"), " ")
     }
     s = s.replace(Regex("[^a-z0-9\\u0590-\\u05ff]+"), " ").trim().replace(Regex("\\s+"), " ")
     return s
